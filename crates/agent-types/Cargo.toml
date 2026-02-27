@@ -11,3 +11,6 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
+
+[dev-dependencies]
+wasm-bindgen-test = { workspace = true }

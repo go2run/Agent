@@ -49,6 +49,9 @@ wasm-logger = "0.2"
 # Error handling
 thiserror = "2"
 
+# Testing
+wasm-bindgen-test = "0.3"
+
 # Utilities
 uuid = { version = "1", features = ["v4", "js"] }
 chrono = { version = "0.4", features = ["wasmbind"] }

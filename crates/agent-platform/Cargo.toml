@@ -49,3 +49,6 @@ features = [
     "StorageManager",
     "Navigator",
 ]
+
+[dev-dependencies]
+wasm-bindgen-test = { workspace = true }

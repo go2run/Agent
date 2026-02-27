@@ -12,3 +12,6 @@ serde_json = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
 log = { workspace = true }
+
+[dev-dependencies]
+wasm-bindgen-test = { workspace = true }
