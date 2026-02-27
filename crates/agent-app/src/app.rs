@@ -17,6 +17,8 @@ use agent_ui::panels::{chat, terminal, settings};
 use agent_ui::state::UiState;
 use agent_ui::theme;
 
+const WORKSPACE_ROOT: &str = "/workspace";
+
 /// The main application state
 pub struct AgentApp {
     ui_state: UiState,
@@ -30,8 +32,10 @@ pub struct AgentApp {
     shell: Rc<dyn ShellPort>,
     /// Virtual filesystem
     vfs: Rc<dyn VfsPort>,
-    /// First frame flag for theme setup
+    /// First frame flag for theme + font setup
     first_frame: bool,
+    /// Whether CJK font has been loaded
+    font_loaded: Rc<RefCell<bool>>,
 }
 
 impl AgentApp {
@@ -58,16 +62,101 @@ impl AgentApp {
         let storage = Rc::new(MemoryStorage::new());
         let vfs = Rc::new(StorageVfs::new(storage));
 
-        Self {
+        let app = Self {
             ui_state: UiState::new(),
             config,
             event_bus,
             runtime: Rc::new(RefCell::new(runtime)),
             llm,
             shell,
-            vfs,
+            vfs: vfs.clone(),
             first_frame: true,
-        }
+            font_loaded: Rc::new(RefCell::new(false)),
+        };
+
+        // Initialize default workspace
+        Self::init_workspace(vfs);
+
+        app
+    }
+
+    /// Create default workspace directories in VFS
+    fn init_workspace(vfs: Rc<dyn VfsPort>) {
+        wasm_bindgen_futures::spawn_local(async move {
+            let dirs = [
+                WORKSPACE_ROOT,
+                &format!("{}/home", WORKSPACE_ROOT),
+                &format!("{}/tmp", WORKSPACE_ROOT),
+                &format!("{}/src", WORKSPACE_ROOT),
+            ];
+            for dir in &dirs {
+                let _ = vfs.mkdir(dir).await;
+            }
+            // Write a welcome README
+            let readme = "# WASM Agent Workspace\n\n\
+                This is your default workspace.\n\
+                Files created by the agent will be stored here.\n";
+            let _ = vfs
+                .write_file(
+                    &format!("{}/README.md", WORKSPACE_ROOT),
+                    readme.as_bytes(),
+                )
+                .await;
+            log::info!("Workspace initialised at {}", WORKSPACE_ROOT);
+        });
+    }
+
+    /// Fetch CJK font from server and install into egui
+    fn load_cjk_font(ctx: egui::Context, loaded_flag: Rc<RefCell<bool>>) {
+        wasm_bindgen_futures::spawn_local(async move {
+            let window = match web_sys::window() {
+                Some(w) => w,
+                None => return,
+            };
+            let resp = match wasm_bindgen_futures::JsFuture::from(
+                window.fetch_with_str("NotoSansTC-Regular.otf"),
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    log::warn!("Failed to fetch CJK font: {:?}", e);
+                    return;
+                }
+            };
+            let resp: web_sys::Response = resp.into();
+            let buf = match resp.array_buffer() {
+                Ok(p) => match wasm_bindgen_futures::JsFuture::from(p).await {
+                    Ok(b) => b,
+                    Err(_) => return,
+                },
+                Err(_) => return,
+            };
+            let uint8 = js_sys::Uint8Array::new(&buf);
+            let bytes = uint8.to_vec();
+
+            let mut fonts = egui::FontDefinitions::default();
+            fonts.font_data.insert(
+                "noto_sans_tc".to_owned(),
+                egui::FontData::from_owned(bytes).into(),
+            );
+            // Prepend CJK font so it takes priority for CJK glyphs
+            fonts
+                .families
+                .entry(egui::FontFamily::Proportional)
+                .or_default()
+                .insert(0, "noto_sans_tc".to_owned());
+            fonts
+                .families
+                .entry(egui::FontFamily::Monospace)
+                .or_default()
+                .push("noto_sans_tc".to_owned());
+
+            ctx.set_fonts(fonts);
+            *loaded_flag.borrow_mut() = true;
+            ctx.request_repaint();
+            log::info!("CJK font loaded");
+        });
     }
 
     fn rebuild_llm(&mut self) {
@@ -77,9 +166,10 @@ impl AgentApp {
 
 impl eframe::App for AgentApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Apply theme on first frame
+        // Apply theme + start font loading on first frame
         if self.first_frame {
             theme::apply_theme(ctx);
+            Self::load_cjk_font(ctx.clone(), self.font_loaded.clone());
             self.first_frame = false;
         }
 

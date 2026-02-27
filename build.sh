@@ -37,5 +37,6 @@ fi
 info "Copying web assets..."
 cp web/index.html "$DIST/index.html"
 cp web/worker.js "$DIST/worker.js"
+cp -r web/fonts/* "$DIST/" 2>/dev/null || true
 
 ok "Build complete → $DIST/"
