@@ -1,0 +1,60 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/agent-types",
+    "crates/agent-core",
+    "crates/agent-platform",
+    "crates/agent-ui",
+    "crates/agent-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/go2run/Agent"
+
+[workspace.dependencies]
+# Internal crates
+agent-types = { path = "crates/agent-types" }
+agent-core = { path = "crates/agent-core" }
+agent-platform = { path = "crates/agent-platform" }
+agent-ui = { path = "crates/agent-ui" }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Async
+async-trait = "0.1"
+futures = "0.3"
+
+# WASM / Browser
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = "0.3"
+gloo-net = { version = "0.6", features = ["http"] }
+gloo-timers = "0.3"
+gloo-utils = "0.2"
+
+# UI
+egui = "0.33"
+eframe = { version = "0.33", default-features = false, features = ["glow"] }
+
+# Logging
+log = "0.4"
+wasm-logger = "0.2"
+
+# Error handling
+thiserror = "2"
+
+# Utilities
+uuid = { version = "1", features = ["v4", "js"] }
+chrono = { version = "0.4", features = ["wasmbind"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true

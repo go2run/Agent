@@ -1,0 +1,14 @@
+[package]
+name = "agent-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Agent runtime, port traits, and event bus — no platform dependencies"
+
+[dependencies]
+agent-types = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+log = { workspace = true }

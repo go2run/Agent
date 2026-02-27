@@ -1,0 +1,10 @@
+[build]
+target = "web/index.html"
+dist = "dist"
+
+[watch]
+watch = ["crates", "web"]
+
+[serve]
+address = "127.0.0.1"
+port = 8080

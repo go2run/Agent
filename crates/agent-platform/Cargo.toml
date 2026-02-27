@@ -1,0 +1,51 @@
+[package]
+name = "agent-platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Browser platform adapters — implements agent-core port traits via wasm-bindgen"
+
+[dependencies]
+agent-types = { workspace = true }
+agent-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+log = { workspace = true }
+wasm-bindgen = { workspace = true }
+wasm-bindgen-futures = { workspace = true }
+js-sys = { workspace = true }
+gloo-net = { workspace = true }
+gloo-timers = { workspace = true }
+gloo-utils = { workspace = true }
+
+[dependencies.web-sys]
+workspace = true
+features = [
+    "console",
+    "Window",
+    "Worker",
+    "MessageEvent",
+    "ErrorEvent",
+    "Blob",
+    "BlobPropertyBag",
+    "Url",
+    "Request",
+    "RequestInit",
+    "RequestMode",
+    "Headers",
+    "Response",
+    "ReadableStream",
+    "ReadableStreamDefaultReader",
+    "IdbFactory",
+    "IdbDatabase",
+    "IdbTransaction",
+    "IdbTransactionMode",
+    "IdbObjectStore",
+    "IdbObjectStoreParameters",
+    "IdbRequest",
+    "IdbOpenDbRequest",
+    "StorageManager",
+    "Navigator",
+]
