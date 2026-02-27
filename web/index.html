@@ -74,40 +74,35 @@
     <!-- egui render target -->
     <canvas id="agent_canvas"></canvas>
 
-    <!--
-        Trunk will inject the WASM bindings here.
-        The data-trunk attributes tell trunk to:
-        1. Compile the Rust crate to WASM
-        2. Generate JS bindings via wasm-bindgen
-        3. Inject <script> tags for the generated JS
-    -->
-    <link data-trunk rel="rust" data-wasm-opt="s" data-bin="agent-app" />
+    <script type="module">
+        import init from './agent_app.js';
 
-    <!-- Copy worker.js to dist/ -->
-    <link data-trunk rel="copy-file" href="worker.js" />
+        async function run() {
+            await init();
 
-    <script>
-        // Hide loading screen once the canvas starts rendering
-        const canvas = document.getElementById('agent_canvas');
-        const loading = document.getElementById('loading');
+            // Hide loading screen once WASM is running
+            const loading = document.getElementById('loading');
+            const canvas = document.getElementById('agent_canvas');
 
-        const observer = new MutationObserver(() => {
-            if (canvas.width > 0 && canvas.height > 0) {
-                loading.classList.add('hidden');
-                setTimeout(() => loading.remove(), 300);
-                observer.disconnect();
-            }
-        });
+            const observer = new MutationObserver(() => {
+                if (canvas.width > 0 && canvas.height > 0) {
+                    loading.classList.add('hidden');
+                    setTimeout(() => loading.remove(), 300);
+                    observer.disconnect();
+                }
+            });
+            observer.observe(canvas, { attributes: true });
 
-        observer.observe(canvas, { attributes: true });
+            // Fallback: hide after timeout
+            setTimeout(() => {
+                if (loading && loading.parentNode) {
+                    loading.classList.add('hidden');
+                    setTimeout(() => loading.remove(), 300);
+                }
+            }, 10000);
+        }
 
-        // Fallback: hide after timeout
-        setTimeout(() => {
-            if (loading && loading.parentNode) {
-                loading.classList.add('hidden');
-                setTimeout(() => loading.remove(), 300);
-            }
-        }, 10000);
+        run().catch(console.error);
     </script>
 </body>
 </html>

@@ -32,9 +32,10 @@ Rust + WebAssembly AI Agent，基於 Hexagonal Architecture (六角架構)，完
 ### 依賴
 
 - [Rust](https://rustup.rs/) (stable)
-- [trunk](https://trunkrs.dev/) (`cargo install trunk`)
+- [wasm-bindgen-cli](https://rustwasm.github.io/wasm-bindgen/) (`cargo install wasm-bindgen-cli`)
 - [wasm-pack](https://rustwasm.github.io/wasm-pack/) (測試用, `cargo install wasm-pack`)
 - wasm32-unknown-unknown target (`rustup target add wasm32-unknown-unknown`)
+- Python3 或 Node.js (HTTP 伺服器)
 
 ### 一鍵啟動
 
@@ -42,7 +43,7 @@ Rust + WebAssembly AI Agent，基於 Hexagonal Architecture (六角架構)，完
 ./start_all.sh
 ```
 
-啟動後在瀏覽器開啟 `http://127.0.0.1:8080`。
+自動執行：依賴檢查 → 測試 → 建構 → 啟動 HTTP 伺服器 → `http://127.0.0.1:8080`
 
 可選參數：
 ```bash
@@ -50,18 +51,21 @@ PORT=3000 ./start_all.sh          # 自訂端口
 SKIP_TESTS=1 ./start_all.sh      # 跳過測試直接啟動
 ```
 
-### 手動啟動
+### 手動建構
 
 ```bash
-# 安裝目標
+# 安裝依賴
 rustup target add wasm32-unknown-unknown
+cargo install wasm-bindgen-cli
 
-# 開發模式 (hot-reload)
-trunk serve
+# 開發建構
+./build.sh
 
-# 生產構建
-trunk build --release
-# 產出在 dist/ 目錄
+# 生產建構 (含 wasm-opt 優化)
+./build.sh release
+
+# 啟動伺服器
+cd dist && python3 -m http.server 8080
 ```
 
 ## 測試
@@ -111,8 +115,8 @@ trunk build --release
 ```
 Agent/
 ├── Cargo.toml          # Workspace 根設定
-├── trunk.toml          # Trunk WASM 建構設定
-├── start_all.sh        # 一鍵啟動
+├── build.sh            # WASM 建構腳本
+├── start_all.sh        # 一鍵啟動 (建構 + HTTP 伺服器)
 ├── test.sh             # 一鍵測試
 ├── web/
 │   ├── index.html      # HTML 入口 + Loading 畫面

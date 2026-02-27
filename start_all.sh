@@ -17,39 +17,45 @@ fail()  { printf "${RED}✗ %s${NC}\n" "$1"; exit 1; }
 
 # ── Pre-flight checks ────────────────────────────────────
 info "Checking dependencies..."
+command -v rustup         &>/dev/null || fail "rustup not found. Install: https://rustup.rs"
+command -v cargo          &>/dev/null || fail "cargo not found"
+command -v wasm-bindgen   &>/dev/null || fail "wasm-bindgen not found. Run: cargo install wasm-bindgen-cli"
 
-command -v rustup  &>/dev/null || fail "rustup not found. Install from https://rustup.rs"
-command -v cargo   &>/dev/null || fail "cargo not found"
-
-# Ensure wasm target
 if ! rustup target list --installed | grep -q wasm32-unknown-unknown; then
     info "Installing wasm32-unknown-unknown target..."
     rustup target add wasm32-unknown-unknown
 fi
-
-# Install trunk if missing
-if ! command -v trunk &>/dev/null; then
-    info "Installing trunk..."
-    cargo install trunk
-fi
-
 ok "All dependencies ready"
 
-# ── Optional: run tests first ─────────────────────────────
+# ── Optional: run tests ──────────────────────────────────
 if [ "${SKIP_TESTS:-}" != "1" ]; then
     info "Running tests..."
     if bash test.sh; then
         ok "All tests passed"
     else
-        fail "Tests failed — fix before running. Set SKIP_TESTS=1 to skip."
+        fail "Tests failed. Set SKIP_TESTS=1 to skip."
     fi
 fi
 
-# ── Build & Serve ─────────────────────────────────────────
+# ── Build ─────────────────────────────────────────────────
+info "Building WASM..."
+bash build.sh release
+ok "Build complete"
+
+# ── Serve ─────────────────────────────────────────────────
 echo ""
 printf "${BOLD}═══════════════════════════════════════════${NC}\n"
-printf "${BOLD}  Starting WASM Agent${NC}\n"
+printf "${BOLD}  WASM Agent${NC}\n"
 printf "${BOLD}  http://%s:%s${NC}\n" "$HOST" "$PORT"
 printf "${BOLD}═══════════════════════════════════════════${NC}\n\n"
 
-trunk serve --address "$HOST" --port "$PORT"
+cd dist
+if command -v python3 &>/dev/null; then
+    python3 -m http.server "$PORT" --bind "$HOST"
+elif command -v python &>/dev/null; then
+    python -m http.server "$PORT" --bind "$HOST"
+elif command -v npx &>/dev/null; then
+    npx serve -l "$PORT" -s .
+else
+    fail "No HTTP server found. Install python3 or node."
+fi
