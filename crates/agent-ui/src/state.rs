@@ -13,6 +13,12 @@ pub struct UiState {
     pub agent_status: AgentState,
     /// Terminal output buffer (from bash executions)
     pub terminal_lines: Vec<TerminalLine>,
+    /// Terminal input field content
+    pub terminal_input: String,
+    /// Command history for up/down arrow
+    pub command_history: Vec<String>,
+    /// Current history navigation index
+    pub history_index: Option<usize>,
     /// Streaming LLM text being assembled
     pub streaming_text: String,
     /// Input field content
@@ -45,6 +51,9 @@ impl UiState {
             messages: Vec::new(),
             agent_status: AgentState::Idle,
             terminal_lines: Vec::new(),
+            terminal_input: String::new(),
+            command_history: Vec::new(),
+            history_index: None,
             streaming_text: String::new(),
             input_text: String::new(),
             show_settings: false,

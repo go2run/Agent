@@ -6,7 +6,7 @@ use std::cell::RefCell;
 use egui::{self, CentralPanel, SidePanel, TopBottomPanel, RichText, Vec2};
 
 use agent_core::event_bus::EventBus;
-use agent_core::ports::{LlmPort, ShellPort, VfsPort};
+use agent_core::ports::{LlmPort, ShellPort, StoragePort, VfsPort};
 use agent_core::runtime::AgentRuntime;
 use agent_platform::llm::OpenAiCompatProvider;
 use agent_platform::shell::WasmerShellAdapter;
@@ -18,23 +18,19 @@ use agent_ui::state::UiState;
 use agent_ui::theme;
 
 const WORKSPACE_ROOT: &str = "/workspace";
+const CONFIG_STORAGE_KEY: &str = "agent:config";
 
 /// The main application state
 pub struct AgentApp {
     ui_state: UiState,
     config: AgentConfig,
     event_bus: EventBus,
-    /// Agent runtime wrapped in RefCell for interior mutability in async tasks
     runtime: Rc<RefCell<AgentRuntime>>,
-    /// LLM provider — recreated when config changes
     llm: Rc<dyn LlmPort>,
-    /// Shell adapter
     shell: Rc<dyn ShellPort>,
-    /// Virtual filesystem
     vfs: Rc<dyn VfsPort>,
-    /// First frame flag for theme + font setup
+    storage: Rc<dyn StoragePort>,
     first_frame: bool,
-    /// Whether CJK font has been loaded
     font_loaded: Rc<RefCell<bool>>,
 }
 
@@ -42,14 +38,10 @@ impl AgentApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let config = AgentConfig::default();
         let event_bus = EventBus::new();
-
-        // Create the agent runtime
         let runtime = AgentRuntime::new(config.clone(), event_bus.clone());
 
-        // Create platform adapters
         let llm = Rc::new(OpenAiCompatProvider::new(config.llm.clone()));
 
-        // Try to create shell adapter, fall back to a stub if Worker creation fails
         let shell: Rc<dyn ShellPort> = match WasmerShellAdapter::new() {
             Ok(s) => Rc::new(s),
             Err(e) => {
@@ -58,11 +50,10 @@ impl AgentApp {
             }
         };
 
-        // Use memory storage + VFS for now (IndexedDB will be initialized async)
-        let storage = Rc::new(MemoryStorage::new());
-        let vfs = Rc::new(StorageVfs::new(storage));
+        let storage: Rc<dyn StoragePort> = Rc::new(MemoryStorage::new());
+        let vfs: Rc<dyn VfsPort> = Rc::new(StorageVfs::new(storage.clone()));
 
-        let app = Self {
+        let mut app = Self {
             ui_state: UiState::new(),
             config,
             event_bus,
@@ -70,14 +61,45 @@ impl AgentApp {
             llm,
             shell,
             vfs: vfs.clone(),
+            storage: storage.clone(),
             first_frame: true,
             font_loaded: Rc::new(RefCell::new(false)),
         };
+
+        // Try to restore config from storage
+        Self::restore_config(storage.clone(), app.config_ref());
 
         // Initialize default workspace
         Self::init_workspace(vfs);
 
         app
+    }
+
+    fn config_ref(&mut self) -> Rc<RefCell<Option<AgentConfig>>> {
+        // Shared slot for async config restore
+        Rc::new(RefCell::new(None))
+    }
+
+    /// Restore config from storage (async)
+    fn restore_config(storage: Rc<dyn StoragePort>, slot: Rc<RefCell<Option<AgentConfig>>>) {
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Ok(Some(data)) = storage.get(CONFIG_STORAGE_KEY).await {
+                if let Ok(config) = serde_json::from_slice::<AgentConfig>(&data) {
+                    *slot.borrow_mut() = Some(config);
+                    log::info!("Config restored from storage");
+                }
+            }
+        });
+    }
+
+    /// Save config to storage (async, fire-and-forget)
+    fn save_config(storage: Rc<dyn StoragePort>, config: &AgentConfig) {
+        if let Ok(json) = serde_json::to_vec(config) {
+            wasm_bindgen_futures::spawn_local(async move {
+                let _ = storage.set(CONFIG_STORAGE_KEY, &json).await;
+                log::info!("Config saved to storage");
+            });
+        }
     }
 
     /// Create default workspace directories in VFS
@@ -92,7 +114,6 @@ impl AgentApp {
             for dir in &dirs {
                 let _ = vfs.mkdir(dir).await;
             }
-            // Write a welcome README
             let readme = "# WASM Agent Workspace\n\n\
                 This is your default workspace.\n\
                 Files created by the agent will be stored here.\n";
@@ -140,7 +161,6 @@ impl AgentApp {
                 "noto_sans_tc".to_owned(),
                 egui::FontData::from_owned(bytes).into(),
             );
-            // Prepend CJK font so it takes priority for CJK glyphs
             fonts
                 .families
                 .entry(egui::FontFamily::Proportional)
@@ -166,21 +186,19 @@ impl AgentApp {
 
 impl eframe::App for AgentApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Apply theme + start font loading on first frame
         if self.first_frame {
             theme::apply_theme(ctx);
             Self::load_cjk_font(ctx.clone(), self.font_loaded.clone());
             self.first_frame = false;
         }
 
-        // Drain events from the agent runtime and update UI state
+        // Drain events from the agent runtime
         let events = self.event_bus.drain();
         if !events.is_empty() {
             self.ui_state.process_events(events);
             ctx.request_repaint();
         }
 
-        // Request repaint while agent is busy (to poll for events)
         if self.ui_state.is_busy() {
             ctx.request_repaint();
         }
@@ -215,7 +233,7 @@ impl eframe::App for AgentApp {
             });
         });
 
-        // ── Settings side panel (conditionally shown) ────────
+        // ── Settings side panel ──────────────────────────────
         if self.ui_state.show_settings {
             SidePanel::right("settings_panel")
                 .min_width(280.0)
@@ -223,6 +241,7 @@ impl eframe::App for AgentApp {
                 .show(ctx, |ui| {
                     if settings::settings_panel(ui, &mut self.config) {
                         self.rebuild_llm();
+                        Self::save_config(self.storage.clone(), &self.config);
                     }
                 });
         }
@@ -230,9 +249,9 @@ impl eframe::App for AgentApp {
         // ── Main content ─────────────────────────────────────
         CentralPanel::default().show(ctx, |ui| {
             let available = ui.available_size();
-            let terminal_height = (available.y * 0.3).max(100.0);
+            let terminal_height = (available.y * 0.3).max(120.0);
 
-            // Chat panel (top portion)
+            // Chat panel (top)
             let chat_height = available.y - terminal_height - 12.0;
             ui.allocate_ui(Vec2::new(available.x, chat_height), |ui| {
                 if let Some(user_msg) = chat::chat_panel(ui, &mut self.ui_state) {
@@ -242,16 +261,18 @@ impl eframe::App for AgentApp {
 
             ui.add_space(4.0);
 
-            // Terminal panel (bottom portion)
+            // Terminal panel (bottom)
             ui.allocate_ui(Vec2::new(available.x, terminal_height), |ui| {
-                terminal::terminal_panel(ui, &self.ui_state);
+                if let Some(cmd) = terminal::terminal_panel(ui, &mut self.ui_state) {
+                    self.dispatch_shell_command(cmd, ctx);
+                }
             });
         });
     }
 }
 
 impl AgentApp {
-    /// Dispatch a user message to the agent runtime (async, non-blocking).
+    /// Dispatch a user message to the agent runtime (async)
     fn dispatch_message(&self, text: String, ctx: &egui::Context) {
         let runtime = self.runtime.clone();
         let llm = self.llm.clone();
@@ -267,6 +288,42 @@ impl AgentApp {
             };
             if let Err(e) = result {
                 log::error!("Agent turn error: {}", e);
+            }
+            ctx.request_repaint();
+        });
+    }
+
+    /// Execute a shell command directly from the terminal (async)
+    fn dispatch_shell_command(&self, cmd: String, ctx: &egui::Context) {
+        let shell = self.shell.clone();
+        let event_bus = self.event_bus.clone();
+        let ctx = ctx.clone();
+
+        wasm_bindgen_futures::spawn_local(async move {
+            match shell.execute(&cmd, None).await {
+                Ok(result) => {
+                    if !result.stdout.is_empty() {
+                        for line in result.stdout.lines() {
+                            event_bus.emit(agent_types::event::AgentEvent::ToolOutput {
+                                call_id: String::new(),
+                                chunk: line.to_string(),
+                            });
+                        }
+                    }
+                    if !result.stderr.is_empty() {
+                        for line in result.stderr.lines() {
+                            event_bus.emit(agent_types::event::AgentEvent::ToolOutput {
+                                call_id: String::new(),
+                                chunk: format!("stderr: {}", line),
+                            });
+                        }
+                    }
+                }
+                Err(e) => {
+                    event_bus.emit(agent_types::event::AgentEvent::Error {
+                        message: format!("Shell error: {}", e),
+                    });
+                }
             }
             ctx.request_repaint();
         });

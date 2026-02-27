@@ -1,7 +1,7 @@
-//! Settings panel — LLM provider config, model selection, API key input.
+//! Settings panel — LLM provider config, storage mode, API key input.
 
 use egui::{self, RichText};
-use agent_types::config::{AgentConfig, LlmProvider};
+use agent_types::config::{AgentConfig, LlmProvider, StorageBackendType};
 use crate::theme::*;
 
 /// Render the settings panel. Returns true if settings were modified.
@@ -16,8 +16,12 @@ pub fn settings_panel(ui: &mut egui::Ui, config: &mut AgentConfig) -> bool {
             ui.heading(RichText::new("Settings").color(TEXT_PRIMARY));
             ui.separator();
 
-            // LLM Provider
-            ui.label(RichText::new("LLM Provider").color(TEXT_SECONDARY).small());
+            // ── LLM Section ──────────────────────────────────
+            ui.label(RichText::new("LLM").color(ACCENT).strong());
+            ui.add_space(2.0);
+
+            // Provider
+            ui.label(RichText::new("Provider").color(TEXT_SECONDARY).small());
             egui::ComboBox::from_id_salt("llm_provider")
                 .selected_text(config.llm.provider.label())
                 .show_ui(ui, |ui| {
@@ -92,7 +96,64 @@ pub fn settings_panel(ui: &mut egui::Ui, config: &mut AgentConfig) -> bool {
             {
                 changed = true;
             }
+
+            ui.add_space(12.0);
+            ui.separator();
+            ui.add_space(4.0);
+
+            // ── Storage Section ──────────────────────────────
+            ui.label(RichText::new("Storage").color(ACCENT).strong());
+            ui.add_space(2.0);
+
+            ui.label(RichText::new("Backend").color(TEXT_SECONDARY).small());
+            egui::ComboBox::from_id_salt("storage_backend")
+                .selected_text(storage_label(&config.storage.backend))
+                .show_ui(ui, |ui| {
+                    for (backend, label, _desc) in storage_options() {
+                        if ui
+                            .selectable_value(&mut config.storage.backend, backend, label)
+                            .changed()
+                        {
+                            changed = true;
+                        }
+                    }
+                });
+
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(storage_description(&config.storage.backend))
+                    .color(TEXT_SECONDARY)
+                    .small()
+                    .italics(),
+            );
         });
 
     changed
+}
+
+fn storage_label(backend: &StorageBackendType) -> &'static str {
+    match backend {
+        StorageBackendType::Auto => "Auto-detect",
+        StorageBackendType::Memory => "Memory",
+        StorageBackendType::IndexedDb => "IndexedDB",
+        StorageBackendType::Opfs => "OPFS",
+    }
+}
+
+fn storage_description(backend: &StorageBackendType) -> &'static str {
+    match backend {
+        StorageBackendType::Auto => "Automatically selects the best available backend. Tries IndexedDB first, falls back to Memory.",
+        StorageBackendType::Memory => "Fast but volatile. All data is lost on page reload.",
+        StorageBackendType::IndexedDb => "Persistent browser storage. Data survives page reloads and browser restarts.",
+        StorageBackendType::Opfs => "Origin Private File System. High-performance persistent storage (experimental).",
+    }
+}
+
+fn storage_options() -> Vec<(StorageBackendType, &'static str, &'static str)> {
+    vec![
+        (StorageBackendType::Auto, "Auto-detect", "Best available"),
+        (StorageBackendType::Memory, "Memory", "Fast, volatile"),
+        (StorageBackendType::IndexedDb, "IndexedDB", "Persistent"),
+        (StorageBackendType::Opfs, "OPFS", "Experimental"),
+    ]
 }
