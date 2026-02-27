@@ -36,6 +36,7 @@ dependencies = [
  "eframe",
  "egui",
  "futures",
+ "js-sys",
  "log",
  "serde",
  "serde_json",
