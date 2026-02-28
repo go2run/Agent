@@ -38,7 +38,6 @@ function sendEvent(event) {
  */
 async function loadSdk() {
     const sources = [
-        './wasmer_sdk.js',
         'https://cdn.jsdelivr.net/npm/@wasmer/sdk@0.10.0/dist/index.mjs',
         'https://unpkg.com/@wasmer/sdk@0.10.0/dist/index.mjs',
     ];
