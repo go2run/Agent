@@ -42,18 +42,18 @@ info "Building WASM..."
 bash build.sh release
 ok "Build complete"
 
-# ── Serve ─────────────────────────────────────────────────
+# ── Serve (with COOP/COEP headers for SharedArrayBuffer) ─
 echo ""
 printf "${BOLD}═══════════════════════════════════════════${NC}\n"
 printf "${BOLD}  WASM Agent${NC}\n"
 printf "${BOLD}  http://%s:%s${NC}\n" "$HOST" "$PORT"
+printf "${BOLD}  Cross-Origin Isolation: enabled${NC}\n"
 printf "${BOLD}═══════════════════════════════════════════${NC}\n\n"
 
 cd dist
 if command -v python3 &>/dev/null; then
-    python3 -m http.server "$PORT" --bind "$HOST"
-elif command -v python &>/dev/null; then
-    python -m http.server "$PORT" --bind "$HOST"
+    # Use the COOP/COEP server for SharedArrayBuffer (@wasmer/sdk)
+    python3 serve.py "$PORT" "$HOST"
 elif command -v npx &>/dev/null; then
     npx serve -l "$PORT" -s .
 else

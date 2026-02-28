@@ -26,6 +26,8 @@ features = [
     "console",
     "Window",
     "Worker",
+    "WorkerOptions",
+    "WorkerType",
     "MessageEvent",
     "ErrorEvent",
     "Blob",

@@ -1,9 +1,12 @@
-//! Shell adapter — bridges to Wasmer-JS running in a Web Worker.
+//! Shell adapter — bridges to @wasmer/sdk running in a Web Worker.
 //!
 //! Architecture:
-//! - Main thread (egui) ←→ Web Worker (Wasmer-JS + WASIX bash)
+//! - Main thread (egui) ←→ Web Worker (@wasmer/sdk + WASIX bash)
 //! - Communication via postMessage with JSON-serialized WorkerCommand/WorkerEvent
-//! - The Worker loads the Wasmer-JS SDK and spawns WASIX bash processes
+//! - The Worker loads @wasmer/sdk and spawns WASIX bash processes
+//!
+//! The worker is created as a module worker (`type: "module"`) so it can
+//! use ES module `import` to load @wasmer/sdk.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -11,10 +14,10 @@ use std::pin::Pin;
 use std::rc::Rc;
 
 use async_trait::async_trait;
-use futures::channel::oneshot;
+use futures::channel::{mpsc, oneshot};
 use futures::stream::{self, Stream};
 use wasm_bindgen::prelude::*;
-use web_sys::{MessageEvent, Worker};
+use web_sys::{MessageEvent, Worker, WorkerOptions, WorkerType};
 
 use agent_core::ports::{ShellPort, ShellStreamEvent};
 use agent_types::{
@@ -23,13 +26,15 @@ use agent_types::{
     tool::{ExecHandle, ExecResult},
 };
 
-/// Shell adapter that communicates with Wasmer-JS via a Web Worker.
+/// Shell adapter that communicates with @wasmer/sdk via a module Web Worker.
 pub struct WasmerShellAdapter {
     worker: Worker,
-    ready: RefCell<bool>,
+    ready: Rc<RefCell<bool>>,
     next_id: RefCell<u64>,
     /// Pending one-shot results, keyed by execution ID
     pending: Rc<RefCell<HashMap<u64, PendingExec>>>,
+    /// Streaming output channels, keyed by execution ID
+    streaming: Rc<RefCell<HashMap<u64, mpsc::UnboundedSender<ShellStreamEvent>>>>,
 }
 
 struct PendingExec {
@@ -39,18 +44,24 @@ struct PendingExec {
 }
 
 impl WasmerShellAdapter {
-    /// Create a new shell adapter. Spawns the Web Worker.
+    /// Create a new shell adapter. Spawns a module Web Worker.
     pub fn new() -> Result<Self> {
-        // Create the worker from the bundled JS file
-        let worker = Worker::new("./worker.js")
-            .map_err(|e| AgentError::Shell(format!("Failed to create worker: {:?}", e)))?;
+        // Create a module worker so it can use ES module imports
+        let options = WorkerOptions::new();
+        options.set_type(WorkerType::Module);
+
+        let worker = Worker::new_with_options("./worker.js", &options)
+            .map_err(|e| AgentError::Shell(format!("Failed to create module worker: {:?}", e)))?;
 
         let pending: Rc<RefCell<HashMap<u64, PendingExec>>> =
+            Rc::new(RefCell::new(HashMap::new()));
+        let streaming: Rc<RefCell<HashMap<u64, mpsc::UnboundedSender<ShellStreamEvent>>>> =
             Rc::new(RefCell::new(HashMap::new()));
         let ready = Rc::new(RefCell::new(false));
 
         // Set up message handler for worker events
         let pending_clone = pending.clone();
+        let streaming_clone = streaming.clone();
         let ready_clone = ready.clone();
         let onmessage = Closure::wrap(Box::new(move |event: MessageEvent| {
             let data = event.data();
@@ -60,19 +71,32 @@ impl WasmerShellAdapter {
                     match worker_event {
                         WorkerEvent::Ready => {
                             *ready_clone.borrow_mut() = true;
-                            log::info!("Wasmer-JS worker ready");
+                            log::info!("Wasmer-JS worker ready (@wasmer/sdk)");
                         }
                         WorkerEvent::Stdout { id, data } => {
+                            // Forward to streaming channel if one exists
+                            if let Some(tx) = streaming_clone.borrow().get(&id) {
+                                let _ = tx.unbounded_send(ShellStreamEvent::Stdout(data.clone()));
+                            }
+                            // Also accumulate for non-streaming callers
                             if let Some(exec) = pending_clone.borrow_mut().get_mut(&id) {
                                 exec.stdout.push_str(&data);
                             }
                         }
                         WorkerEvent::Stderr { id, data } => {
+                            if let Some(tx) = streaming_clone.borrow().get(&id) {
+                                let _ = tx.unbounded_send(ShellStreamEvent::Stderr(data.clone()));
+                            }
                             if let Some(exec) = pending_clone.borrow_mut().get_mut(&id) {
                                 exec.stderr.push_str(&data);
                             }
                         }
                         WorkerEvent::ExitCode { id, code } => {
+                            // Close streaming channel
+                            if let Some(tx) = streaming_clone.borrow_mut().remove(&id) {
+                                let _ = tx.unbounded_send(ShellStreamEvent::Exit(code));
+                            }
+                            // Resolve one-shot
                             if let Some(mut exec) = pending_clone.borrow_mut().remove(&id) {
                                 if let Some(sender) = exec.sender.take() {
                                     let _ = sender.send(ExecResult {
@@ -84,6 +108,11 @@ impl WasmerShellAdapter {
                             }
                         }
                         WorkerEvent::Error { id, message } => {
+                            // Close streaming channel with error
+                            if let Some(tx) = streaming_clone.borrow_mut().remove(&id) {
+                                let _ = tx.unbounded_send(ShellStreamEvent::Error(message.clone()));
+                            }
+                            // Resolve one-shot with error
                             if let Some(mut exec) = pending_clone.borrow_mut().remove(&id) {
                                 exec.stderr.push_str(&message);
                                 if let Some(sender) = exec.sender.take() {
@@ -112,9 +141,10 @@ impl WasmerShellAdapter {
 
         Ok(Self {
             worker,
-            ready: RefCell::new(false),
+            ready: Rc::new(RefCell::new(false)),
             next_id: RefCell::new(1),
             pending,
+            streaming,
         })
     }
 
@@ -165,12 +195,36 @@ impl ShellPort for WasmerShellAdapter {
 
     fn execute_streaming(
         &self,
-        _cmd: &str,
+        cmd: &str,
     ) -> Pin<Box<dyn Stream<Item = ShellStreamEvent>>> {
-        // Streaming shell will be implemented with mpsc channels in follow-up
-        Box::pin(stream::once(async {
-            ShellStreamEvent::Error("Streaming not yet implemented".to_string())
-        }))
+        let id = self.next_exec_id();
+        let (tx, rx) = mpsc::unbounded();
+
+        // Register the streaming channel
+        self.streaming.borrow_mut().insert(id, tx);
+
+        // Also register a pending exec (for cleanup)
+        self.pending.borrow_mut().insert(
+            id,
+            PendingExec {
+                stdout: String::new(),
+                stderr: String::new(),
+                sender: None,
+            },
+        );
+
+        // Send the exec command
+        if let Err(e) = self.send_command(&WorkerCommand::ExecBash {
+            id,
+            cmd: cmd.to_string(),
+            timeout_ms: None,
+        }) {
+            return Box::pin(stream::once(async move {
+                ShellStreamEvent::Error(format!("Failed to send command: {}", e))
+            }));
+        }
+
+        Box::pin(rx)
     }
 
     async fn cancel(&self, handle: ExecHandle) -> Result<()> {

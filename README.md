@@ -107,7 +107,7 @@ User Input → Chat Panel
 | wasm32 target | `rustup target add wasm32-unknown-unknown` |
 | wasm-bindgen-cli | `cargo install wasm-bindgen-cli` |
 | wasm-pack (測試用) | `cargo install wasm-pack` |
-| HTTP server | Python3 (內建) 或 Node.js |
+| HTTP server | Python3 (內建，含 COOP/COEP server) 或 Node.js |
 
 ### 一鍵啟動
 
@@ -193,7 +193,7 @@ cd dist && python3 -m http.server 8080
 
 | 項目 | 現狀 | 說明 |
 |------|------|------|
-| Shell 執行 | Web Worker fallback shell | Wasmer-JS WASIX 完整 bash 尚未整合，目前使用 JS fallback (echo, date, ls 等基本指令) |
+| Shell 執行 | @wasmer/sdk + fallback | Worker 使用 `@wasmer/sdk` 載入 WASIX bash；需 COOP/COEP headers 啟用 `SharedArrayBuffer`。若 SDK 不可用則降級至 JS fallback shell |
 | Streaming LLM | 僅 non-streaming | `stream_chat()` 已定義但 UI 尚未接入 SSE streaming |
 | IndexedDB 自動切換 | 手動選擇 | Settings 可選 IndexedDB，但 Auto-detect 尚未在啟動時非同步初始化 IndexedDB |
 | OPFS Storage | 未實作 | Port trait 已定義，adapter 待開發 |
@@ -204,7 +204,7 @@ cd dist && python3 -m http.server 8080
 
 ### 未來增強 (Roadmap)
 
-1. **Wasmer-JS 完整 bash** — 整合 `@aspect/wasmer-js` SDK，在 Web Worker 中運行真實 WASIX bash
+1. ~~**Wasmer-JS 完整 bash**~~ ✅ — 已整合 `@wasmer/sdk`，在 module Web Worker 中運行 WASIX bash (需 COOP/COEP)
 2. **SSE Streaming** — 接入 `stream_chat()` 讓 LLM 回應逐字顯示
 3. **Anthropic Messages API adapter** — 支援 Claude 原生 API 格式
 4. **Google Gemini adapter** — 支援 Gemini 原生 API 格式
@@ -227,7 +227,8 @@ Agent/
 ├── test.sh                 # 一鍵測試
 ├── web/
 │   ├── index.html          # HTML 入口 + Loading 畫面
-│   ├── worker.js           # Web Worker (Shell fallback)
+│   ├── worker.js           # Module Web Worker (@wasmer/sdk + fallback shell)
+│   ├── serve.py            # COOP/COEP HTTP server (SharedArrayBuffer)
 │   └── fonts/
 │       └── NotoSansTC-Regular.otf  # 繁體中文字體
 └── crates/

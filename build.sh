@@ -37,6 +37,7 @@ fi
 info "Copying web assets..."
 cp web/index.html "$DIST/index.html"
 cp web/worker.js "$DIST/worker.js"
+cp web/serve.py "$DIST/serve.py"
 cp -r web/fonts/* "$DIST/" 2>/dev/null || true
 
 ok "Build complete → $DIST/"
