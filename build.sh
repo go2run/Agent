@@ -40,4 +40,19 @@ cp web/worker.js "$DIST/worker.js"
 cp web/serve.py "$DIST/serve.py"
 cp -r web/fonts/* "$DIST/" 2>/dev/null || true
 
+# Download @wasmer/sdk for local serving (avoids COEP/CORS issues)
+WASMER_SDK_VER="0.10.0"
+SDK_DIR="$DIST/vendor/wasmer-sdk"
+if [ ! -f "$SDK_DIR/wasmer_js_bg.wasm" ]; then
+    info "Downloading @wasmer/sdk v${WASMER_SDK_VER}..."
+    mkdir -p "$SDK_DIR"
+    SDK_CDN="https://cdn.jsdelivr.net/npm/@wasmer/sdk@${WASMER_SDK_VER}/dist"
+    curl -sL "$SDK_CDN/index.mjs"          -o "$SDK_DIR/index.mjs"
+    curl -sL "$SDK_CDN/wasmer_js_bg.wasm"  -o "$SDK_DIR/wasmer_js_bg.wasm"
+    curl -sL "$SDK_CDN/worker.mjs"         -o "$SDK_DIR/worker.mjs"
+    ok "@wasmer/sdk v${WASMER_SDK_VER} downloaded"
+else
+    ok "@wasmer/sdk already cached in dist/"
+fi
+
 ok "Build complete → $DIST/"

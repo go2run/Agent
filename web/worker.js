@@ -1,8 +1,8 @@
 /**
  * Web Worker — Wasmer-JS WASIX Runtime Bridge
  *
- * This Worker hosts the @wasmer/sdk and executes WASIX programs (bash, etc.)
- * isolated from the main UI thread so that synchronous WASI I/O doesn't block rendering.
+ * Loads @wasmer/sdk from local vendor/ directory (avoiding COEP/CORS issues)
+ * and executes WASIX bash in a real WebAssembly sandbox.
  *
  * Protocol:
  *   Main thread → Worker: WorkerCommand (JSON via postMessage)
@@ -10,102 +10,117 @@
  *
  * Requirements:
  *   - Page must be cross-origin isolated (COOP + COEP headers) for SharedArrayBuffer
- *   - Worker must be created with { type: "module" } for ES module imports
- *
- * WASIX bash is loaded from the Wasmer registry on first use and cached.
+ *   - Worker must be created with { type: "module" }
+ *   - vendor/wasmer-sdk/ must be served alongside this file
  */
 
-// ─── SDK import (from CDN or local) ────────────────────────
-// We try multiple sources to be resilient:
-// 1. Local path (if served alongside the app via npm/bundler)
-// 2. jsDelivr CDN
-// 3. unpkg CDN
+// ─── State ──────────────────────────────────────────────────
 
 let sdk = null;
-let wasmerReady = false;
 let bashPackage = null;
+let initPromise = null;   // resolved when SDK is ready (or failed)
+let initDone = false;
 let runningProcesses = new Map();
 
-/**
- * Send a typed event back to the main thread.
- */
+// ─── Helpers ────────────────────────────────────────────────
+
 function sendEvent(event) {
     self.postMessage(event);
 }
 
-/**
- * Dynamically import the @wasmer/sdk from available sources.
- */
-async function loadSdk() {
-    const sources = [
-        'https://cdn.jsdelivr.net/npm/@wasmer/sdk@0.10.0/dist/index.mjs',
-        'https://unpkg.com/@wasmer/sdk@0.10.0/dist/index.mjs',
-    ];
+// ─── Initialization ─────────────────────────────────────────
 
-    for (const src of sources) {
-        try {
-            const mod = await import(src);
-            console.log(`[Worker] Loaded @wasmer/sdk from: ${src}`);
-            return mod;
-        } catch (e) {
-            console.warn(`[Worker] Failed to load SDK from ${src}:`, e.message);
-        }
-    }
-    return null;
+/**
+ * Initialize the @wasmer/sdk and pre-load bash.
+ * Returns a promise that resolves when ready (or falls back).
+ */
+function ensureInit() {
+    if (initPromise) return initPromise;
+    initPromise = doInit();
+    return initPromise;
 }
 
-/**
- * Initialize the Wasmer-JS SDK and pre-load the bash package.
- */
-async function initWasmer() {
-    if (wasmerReady) return;
-
+async function doInit() {
     try {
-        // Check SharedArrayBuffer availability (requires COOP/COEP)
+        // SharedArrayBuffer check
         if (typeof SharedArrayBuffer === 'undefined') {
-            console.warn(
-                '[Worker] SharedArrayBuffer not available. ' +
-                'Ensure COOP/COEP headers are set. Falling back to basic shell.'
-            );
-            wasmerReady = true;
+            console.warn('[Worker] SharedArrayBuffer not available — fallback mode');
+            initDone = true;
             sendEvent({ type: 'Ready' });
             return;
         }
 
-        sdk = await loadSdk();
+        // Import SDK from local vendor (same-origin, no COEP issues)
+        try {
+            sdk = await import('./vendor/wasmer-sdk/index.mjs');
+            console.log('[Worker] Loaded @wasmer/sdk from local vendor/');
+        } catch (e) {
+            console.warn('[Worker] Local SDK import failed:', e.message);
+            // Try CDN as last resort
+            try {
+                sdk = await import('https://cdn.jsdelivr.net/npm/@wasmer/sdk@0.10.0/dist/index.mjs');
+                console.log('[Worker] Loaded @wasmer/sdk from CDN');
+            } catch (e2) {
+                console.warn('[Worker] CDN SDK import failed:', e2.message);
+            }
+        }
+
         if (!sdk || !sdk.init) {
-            console.warn('[Worker] @wasmer/sdk not available, using fallback shell');
-            wasmerReady = true;
+            console.warn('[Worker] @wasmer/sdk not available — fallback mode');
+            initDone = true;
             sendEvent({ type: 'Ready' });
             return;
         }
 
-        // Initialize the Wasmer runtime
+        // Initialize the Wasmer WASM runtime
         await sdk.init();
-        console.log('[Worker] Wasmer SDK initialized');
+        console.log('[Worker] Wasmer SDK runtime initialized');
 
-        // Pre-load the bash package from the Wasmer registry
+        // Pre-load bash package from Wasmer registry
         try {
             bashPackage = await sdk.Wasmer.fromRegistry('sharrattj/bash');
-            console.log('[Worker] Bash package loaded from registry');
+            console.log('[Worker] Bash package loaded from Wasmer registry');
         } catch (e) {
-            console.warn('[Worker] Failed to pre-load bash package:', e.message);
-            // Will retry on first exec
+            console.warn('[Worker] Bash pre-load failed:', e.message);
         }
 
-        wasmerReady = true;
+        initDone = true;
         sendEvent({ type: 'Ready' });
     } catch (error) {
-        console.warn('[Worker] Wasmer init failed, using fallback:', error.message);
-        wasmerReady = true;
+        console.error('[Worker] Init failed:', error);
+        initDone = true;
         sendEvent({ type: 'Ready' });
     }
 }
 
-/**
- * Execute a bash command via WASIX.
- * Falls back to the simple command parser if Wasmer SDK is not available.
- */
+// ─── Command queue ──────────────────────────────────────────
+// All commands wait for init to complete before executing.
+
+const commandQueue = [];
+let processing = false;
+
+async function enqueue(fn) {
+    commandQueue.push(fn);
+    if (!processing) drainQueue();
+}
+
+async function drainQueue() {
+    processing = true;
+    // Wait for init before processing any commands
+    await ensureInit();
+    while (commandQueue.length > 0) {
+        const fn = commandQueue.shift();
+        try {
+            await fn();
+        } catch (e) {
+            console.error('[Worker] Command error:', e);
+        }
+    }
+    processing = false;
+}
+
+// ─── Exec: WASIX bash ──────────────────────────────────────
+
 async function execBash(id, cmd, timeoutMs) {
     try {
         if (sdk && bashPackage) {
@@ -122,132 +137,84 @@ async function execBash(id, cmd, timeoutMs) {
     }
 }
 
-/**
- * Execute via the @wasmer/sdk WASIX runtime.
- */
 async function execBashWasmer(id, cmd, timeoutMs) {
     let instance = null;
-
     try {
-        // Ensure bash package is loaded
+        // Lazy-load bash if not pre-loaded
         if (!bashPackage) {
             bashPackage = await sdk.Wasmer.fromRegistry('sharrattj/bash');
         }
 
-        // Spawn a bash process with the command
         instance = await bashPackage.entrypoint.run({
             args: ['-c', cmd],
         });
 
-        // Track the running process for cancellation
         runningProcesses.set(id, instance);
 
-        // Set up timeout if specified
+        // Timeout
         let timeoutHandle = null;
         let timedOut = false;
-
         if (timeoutMs) {
             timeoutHandle = setTimeout(() => {
                 timedOut = true;
-                if (instance && instance.kill) {
-                    instance.kill();
-                }
-                sendEvent({
-                    type: 'Error',
-                    id: id,
-                    message: `Timeout after ${timeoutMs}ms`,
-                });
+                try { instance?.kill?.(); } catch (_) {}
+                sendEvent({ type: 'Error', id, message: `Timeout after ${timeoutMs}ms` });
             }, timeoutMs);
         }
 
-        // Stream stdout in real-time if possible
+        // Try streaming output, fall back to buffered
         if (instance.stdout && typeof instance.stdout.pipeTo === 'function') {
-            // Set up streaming stdout
-            const stdoutReader = streamToEvents(id, instance.stdout, 'Stdout');
-            const stderrReader = instance.stderr
-                ? streamToEvents(id, instance.stderr, 'Stderr')
+            const stdoutDone = pipeStream(id, instance.stdout, 'Stdout');
+            const stderrDone = instance.stderr
+                ? pipeStream(id, instance.stderr, 'Stderr')
                 : Promise.resolve();
 
-            // Wait for the process to finish
             const output = await instance.wait();
-
-            // Wait for streams to finish
-            await Promise.allSettled([stdoutReader, stderrReader]);
+            await Promise.allSettled([stdoutDone, stderrDone]);
 
             if (timeoutHandle) clearTimeout(timeoutHandle);
             if (timedOut) return;
-
-            sendEvent({ type: 'ExitCode', id: id, code: output.code ?? 0 });
+            sendEvent({ type: 'ExitCode', id, code: output.code ?? 0 });
         } else {
-            // Non-streaming: wait for complete output
             const output = await instance.wait();
-
             if (timeoutHandle) clearTimeout(timeoutHandle);
             if (timedOut) return;
 
-            const decoder = new TextDecoder();
+            const dec = new TextDecoder();
             const stdout = output.stdout
-                ? (typeof output.stdout === 'string' ? output.stdout : decoder.decode(output.stdout))
+                ? (typeof output.stdout === 'string' ? output.stdout : dec.decode(output.stdout))
                 : '';
             const stderr = output.stderr
-                ? (typeof output.stderr === 'string' ? output.stderr : decoder.decode(output.stderr))
+                ? (typeof output.stderr === 'string' ? output.stderr : dec.decode(output.stderr))
                 : '';
 
-            if (stdout) {
-                sendEvent({ type: 'Stdout', id: id, data: stdout });
-            }
-            if (stderr) {
-                sendEvent({ type: 'Stderr', id: id, data: stderr });
-            }
-
-            sendEvent({ type: 'ExitCode', id: id, code: output.code ?? 0 });
+            if (stdout) sendEvent({ type: 'Stdout', id, data: stdout });
+            if (stderr) sendEvent({ type: 'Stderr', id, data: stderr });
+            sendEvent({ type: 'ExitCode', id, code: output.code ?? 0 });
         }
     } catch (error) {
-        sendEvent({
-            type: 'Error',
-            id: id,
-            message: `Wasmer execution error: ${error.message}`,
-        });
+        sendEvent({ type: 'Error', id, message: `WASIX error: ${error.message}` });
     } finally {
         runningProcesses.delete(id);
     }
 }
 
-/**
- * Pipe a ReadableStream to postMessage events for real-time streaming.
- */
-async function streamToEvents(id, readableStream, eventType) {
-    const decoder = new TextDecoder();
+async function pipeStream(id, stream, eventType) {
+    const dec = new TextDecoder();
     try {
-        await readableStream.pipeTo(
-            new WritableStream({
-                write(chunk) {
-                    const text = typeof chunk === 'string'
-                        ? chunk
-                        : decoder.decode(chunk, { stream: true });
-                    if (text) {
-                        sendEvent({ type: eventType, id: id, data: text });
-                    }
-                },
-            })
-        );
-    } catch (e) {
-        // Stream may be cancelled on process kill — that's OK
-        if (!e.message?.includes('cancel')) {
-            console.warn(`[Worker] Stream error (${eventType}):`, e.message);
-        }
-    }
+        await stream.pipeTo(new WritableStream({
+            write(chunk) {
+                const text = typeof chunk === 'string' ? chunk : dec.decode(chunk, { stream: true });
+                if (text) sendEvent({ type: eventType, id, data: text });
+            },
+        }));
+    } catch (_) { /* stream cancelled on kill — OK */ }
 }
 
-/**
- * Fallback command execution — simulates basic shell behavior
- * when the full @wasmer/sdk WASIX runtime is not available.
- */
-async function execBashFallback(id, cmd) {
-    const trimmed = cmd.trim();
+// ─── Exec: Fallback shell ──────────────────────────────────
 
-    // Handle pipes and redirections minimally
-    const parts = trimmed.split(/\s+/);
+async function execBashFallback(id, cmd) {
+    const parts = cmd.trim().split(/\s+/);
     const command = parts[0];
     const args = parts.slice(1);
 
@@ -257,7 +224,6 @@ async function execBashFallback(id, cmd) {
 
     switch (command) {
         case 'echo':
-            // Handle -n flag and basic variable expansion
             if (args[0] === '-n') {
                 stdout = args.slice(1).join(' ');
             } else {
@@ -270,31 +236,17 @@ async function execBashFallback(id, cmd) {
             break;
 
         case 'date':
-            if (args.includes('-u')) {
-                stdout = new Date().toUTCString() + '\n';
-            } else {
-                stdout = new Date().toString() + '\n';
-            }
+            stdout = (args.includes('-u') ? new Date().toUTCString() : new Date().toString()) + '\n';
             break;
 
-        case 'whoami':
-            stdout = 'wasm-agent\n';
-            break;
-
-        case 'hostname':
-            stdout = 'wasm-agent-host\n';
-            break;
+        case 'whoami':  stdout = 'wasm-agent\n'; break;
+        case 'hostname': stdout = 'wasm-agent-host\n'; break;
+        case 'pwd':     stdout = '/workspace\n'; break;
 
         case 'uname':
-            if (args.includes('-a')) {
-                stdout = 'WASIX wasm32 wasm32 WASIX wasm32 Wasmer-JS WASIX\n';
-            } else {
-                stdout = 'WASIX\n';
-            }
-            break;
-
-        case 'pwd':
-            stdout = '/workspace\n';
+            stdout = args.includes('-a')
+                ? 'WASIX wasm32 wasm32 WASIX wasm32 Wasmer-JS WASIX\n'
+                : 'WASIX\n';
             break;
 
         case 'ls':
@@ -306,25 +258,16 @@ async function execBashFallback(id, cmd) {
                 stdout = 'NAME="WASIX"\nVERSION="1.0"\nID=wasix\n';
             } else {
                 stderr = `cat: ${args[0] || ''}: No such file or directory\n`;
-                stdout = '[Fallback Shell] Full filesystem not available.\n' +
-                         'Install @wasmer/sdk and enable COOP/COEP headers for real WASIX bash.\n';
                 exitCode = 1;
             }
             break;
 
         case 'env':
-            stdout = [
-                'SHELL=/bin/bash',
-                'HOME=/workspace/home',
-                'USER=wasm-agent',
-                'PATH=/bin:/usr/bin',
-                'PWD=/workspace',
-                'TERM=xterm-256color',
-            ].join('\n') + '\n';
+            stdout = 'SHELL=/bin/bash\nHOME=/workspace/home\nUSER=wasm-agent\nPATH=/bin:/usr/bin\nPWD=/workspace\n';
             break;
 
         case 'which':
-            if (['echo', 'date', 'whoami', 'uname', 'pwd', 'ls', 'cat', 'env', 'true', 'false'].includes(args[0])) {
+            if (['echo','date','whoami','uname','pwd','ls','cat','env','true','false'].includes(args[0])) {
                 stdout = `/usr/bin/${args[0]}\n`;
             } else {
                 stderr = `which: no ${args[0]} in (/bin:/usr/bin)\n`;
@@ -332,105 +275,62 @@ async function execBashFallback(id, cmd) {
             }
             break;
 
-        case 'true':
-            exitCode = 0;
-            break;
-
-        case 'false':
-            exitCode = 1;
-            break;
+        case 'true':  exitCode = 0; break;
+        case 'false': exitCode = 1; break;
 
         case 'sleep':
-            {
-                const seconds = parseFloat(args[0]) || 1;
-                await new Promise(r => setTimeout(r, seconds * 1000));
-            }
-            break;
-
-        case 'head':
-        case 'tail':
-        case 'grep':
-        case 'sed':
-        case 'awk':
-        case 'sort':
-        case 'wc':
-        case 'cut':
-        case 'tr':
-        case 'mkdir':
-        case 'rm':
-        case 'cp':
-        case 'mv':
-        case 'touch':
-        case 'chmod':
-        case 'find':
-        case 'curl':
-        case 'wget':
-            stderr = `[Fallback Shell] '${command}' requires full WASIX runtime.\n`;
-            stdout = 'Enable @wasmer/sdk with COOP/COEP headers for real bash.\n';
-            exitCode = 127;
+            await new Promise(r => setTimeout(r, (parseFloat(args[0]) || 1) * 1000));
             break;
 
         default:
             stderr = `[Fallback Shell] '${command}': command not found\n`;
-            stdout = 'Note: Full WASIX bash requires @wasmer/sdk.\n' +
-                     'Serve with COOP/COEP headers to enable SharedArrayBuffer.\n';
             exitCode = 127;
             break;
     }
 
-    if (stdout) {
-        sendEvent({ type: 'Stdout', id: id, data: stdout });
-    }
-    if (stderr) {
-        sendEvent({ type: 'Stderr', id: id, data: stderr });
-    }
-
-    sendEvent({ type: 'ExitCode', id: id, code: exitCode });
+    if (stdout) sendEvent({ type: 'Stdout', id, data: stdout });
+    if (stderr) sendEvent({ type: 'Stderr', id, data: stderr });
+    sendEvent({ type: 'ExitCode', id, code: exitCode });
 }
 
-/**
- * Cancel a running process.
- */
+// ─── Process management ────────────────────────────────────
+
 function cancelExec(id) {
     const instance = runningProcesses.get(id);
     if (instance) {
-        if (typeof instance.kill === 'function') {
-            instance.kill();
-        }
+        try { instance.kill?.(); } catch (_) {}
         runningProcesses.delete(id);
-        sendEvent({ type: 'ExitCode', id: id, code: 137 }); // SIGKILL
+        sendEvent({ type: 'ExitCode', id, code: 137 });
     }
 }
 
-/**
- * Write to stdin of a running process.
- */
 async function writeStdin(id, data) {
     const instance = runningProcesses.get(id);
-    if (instance && instance.stdin) {
+    if (instance?.stdin) {
         try {
-            const encoder = new TextEncoder();
             const writer = instance.stdin.getWriter();
-            await writer.write(encoder.encode(data));
+            await writer.write(new TextEncoder().encode(data));
             writer.releaseLock();
         } catch (e) {
-            console.warn(`[Worker] Failed to write stdin for ${id}:`, e.message);
+            console.warn(`[Worker] stdin write failed for ${id}:`, e.message);
         }
     }
 }
 
-// ─── Message handler ─────────────────────────────────────────
+// ─── Message handler ───────────────────────────────────────
+// All commands go through the queue, which waits for init first.
 
-self.onmessage = async function(event) {
+self.onmessage = function(event) {
     const msg = event.data;
 
     switch (msg.type) {
         case 'Init':
-            await initWasmer();
+            // Trigger init (idempotent); commands will wait for it
+            ensureInit();
             break;
 
         case 'ExecBash':
-            await execBash(msg.id, msg.cmd, msg.timeout_ms || null);
+            enqueue(() => execBash(msg.id, msg.cmd, msg.timeout_ms || null));
             break;
 
         case 'CancelExec':
@@ -438,7 +338,7 @@ self.onmessage = async function(event) {
             break;
 
         case 'WriteStdin':
-            await writeStdin(msg.id, msg.data);
+            enqueue(() => writeStdin(msg.id, msg.data));
             break;
 
         default:
@@ -446,4 +346,7 @@ self.onmessage = async function(event) {
     }
 };
 
-console.log('[Worker] Shell worker loaded (ES module)');
+// Start init eagerly when the worker loads
+ensureInit();
+
+console.log('[Worker] Shell worker loaded (ES module + @wasmer/sdk)');
