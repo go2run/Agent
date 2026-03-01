@@ -10,7 +10,7 @@ use agent_core::ports::{LlmPort, ShellPort, StoragePort, VfsPort};
 use agent_core::runtime::AgentRuntime;
 use agent_platform::llm::OpenAiCompatProvider;
 use agent_platform::shell::WasmerShellAdapter;
-use agent_platform::storage::MemoryStorage;
+use agent_platform::storage::{MemoryStorage, auto_detect_storage};
 use agent_platform::vfs::StorageVfs;
 use agent_types::config::AgentConfig;
 use agent_ui::panels::{chat, terminal, settings};
@@ -29,9 +29,16 @@ pub struct AgentApp {
     llm: Rc<dyn LlmPort>,
     shell: Rc<dyn ShellPort>,
     vfs: Rc<dyn VfsPort>,
-    storage: Rc<dyn StoragePort>,
+    /// Swappable storage — starts as MemoryStorage, upgrades to IndexedDB async
+    storage: Rc<RefCell<Rc<dyn StoragePort>>>,
     first_frame: bool,
     font_loaded: Rc<RefCell<bool>>,
+    /// Shared slot for async config restoration from persistent storage
+    pending_config: Rc<RefCell<Option<AgentConfig>>>,
+    /// Whether async storage upgrade is done
+    storage_ready: Rc<RefCell<bool>>,
+    /// UI feedback for save operations
+    save_feedback: Rc<RefCell<Option<settings::SaveFeedback>>>,
 }
 
 impl AgentApp {
@@ -50,81 +57,86 @@ impl AgentApp {
             }
         };
 
-        let storage: Rc<dyn StoragePort> = Rc::new(MemoryStorage::new());
-        let vfs: Rc<dyn VfsPort> = Rc::new(StorageVfs::new(storage.clone()));
+        // Start with MemoryStorage; async upgrade to IndexedDB below
+        let mem_storage: Rc<dyn StoragePort> = Rc::new(MemoryStorage::new());
+        let storage: Rc<RefCell<Rc<dyn StoragePort>>> = Rc::new(RefCell::new(mem_storage));
+        let vfs: Rc<dyn VfsPort> = Rc::new(StorageVfs::new(storage.borrow().clone()));
 
-        let mut app = Self {
+        let pending_config: Rc<RefCell<Option<AgentConfig>>> = Rc::new(RefCell::new(None));
+        let storage_ready = Rc::new(RefCell::new(false));
+        let save_feedback: Rc<RefCell<Option<settings::SaveFeedback>>> = Rc::new(RefCell::new(None));
+
+        // Kick off async storage upgrade + config restore
+        {
+            let storage_slot = storage.clone();
+            let config_slot = pending_config.clone();
+            let ready_flag = storage_ready.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                match auto_detect_storage().await {
+                    Ok(persistent_storage) => {
+                        let backend = persistent_storage.backend_name().to_string();
+                        log::info!("Storage upgraded to: {}", backend);
+
+                        // Try to restore config from persistent storage
+                        if let Ok(Some(data)) = persistent_storage.get(CONFIG_STORAGE_KEY).await {
+                            if let Ok(restored) = serde_json::from_slice::<AgentConfig>(&data) {
+                                log::info!("Config restored from {}", backend);
+                                *config_slot.borrow_mut() = Some(restored);
+                            }
+                        }
+
+                        // Swap in the persistent storage
+                        *storage_slot.borrow_mut() = persistent_storage;
+                    }
+                    Err(e) => {
+                        log::warn!("Storage upgrade failed: {}. Staying on MemoryStorage.", e);
+                    }
+                }
+                *ready_flag.borrow_mut() = true;
+            });
+        }
+
+        // Initialize default workspace
+        {
+            let vfs_clone = vfs.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                let dirs = [
+                    WORKSPACE_ROOT,
+                    &format!("{}/home", WORKSPACE_ROOT),
+                    &format!("{}/tmp", WORKSPACE_ROOT),
+                    &format!("{}/src", WORKSPACE_ROOT),
+                ];
+                for dir in &dirs {
+                    let _ = vfs_clone.mkdir(dir).await;
+                }
+                let readme = "# WASM Agent Workspace\n\n\
+                    This is your default workspace.\n\
+                    Files created by the agent will be stored here.\n";
+                let _ = vfs_clone
+                    .write_file(
+                        &format!("{}/README.md", WORKSPACE_ROOT),
+                        readme.as_bytes(),
+                    )
+                    .await;
+                log::info!("Workspace initialised at {}", WORKSPACE_ROOT);
+            });
+        }
+
+        Self {
             ui_state: UiState::new(),
             config,
             event_bus,
             runtime: Rc::new(RefCell::new(runtime)),
             llm,
             shell,
-            vfs: vfs.clone(),
-            storage: storage.clone(),
+            vfs,
+            storage,
             first_frame: true,
             font_loaded: Rc::new(RefCell::new(false)),
-        };
-
-        // Try to restore config from storage
-        Self::restore_config(storage.clone(), app.config_ref());
-
-        // Initialize default workspace
-        Self::init_workspace(vfs);
-
-        app
-    }
-
-    fn config_ref(&mut self) -> Rc<RefCell<Option<AgentConfig>>> {
-        // Shared slot for async config restore
-        Rc::new(RefCell::new(None))
-    }
-
-    /// Restore config from storage (async)
-    fn restore_config(storage: Rc<dyn StoragePort>, slot: Rc<RefCell<Option<AgentConfig>>>) {
-        wasm_bindgen_futures::spawn_local(async move {
-            if let Ok(Some(data)) = storage.get(CONFIG_STORAGE_KEY).await {
-                if let Ok(config) = serde_json::from_slice::<AgentConfig>(&data) {
-                    *slot.borrow_mut() = Some(config);
-                    log::info!("Config restored from storage");
-                }
-            }
-        });
-    }
-
-    /// Save config to storage (async, fire-and-forget)
-    fn save_config(storage: Rc<dyn StoragePort>, config: &AgentConfig) {
-        if let Ok(json) = serde_json::to_vec(config) {
-            wasm_bindgen_futures::spawn_local(async move {
-                let _ = storage.set(CONFIG_STORAGE_KEY, &json).await;
-                log::info!("Config saved to storage");
-            });
+            pending_config,
+            storage_ready,
+            save_feedback,
         }
-    }
-
-    /// Create default workspace directories in VFS
-    fn init_workspace(vfs: Rc<dyn VfsPort>) {
-        wasm_bindgen_futures::spawn_local(async move {
-            let dirs = [
-                WORKSPACE_ROOT,
-                &format!("{}/home", WORKSPACE_ROOT),
-                &format!("{}/tmp", WORKSPACE_ROOT),
-                &format!("{}/src", WORKSPACE_ROOT),
-            ];
-            for dir in &dirs {
-                let _ = vfs.mkdir(dir).await;
-            }
-            let readme = "# WASM Agent Workspace\n\n\
-                This is your default workspace.\n\
-                Files created by the agent will be stored here.\n";
-            let _ = vfs
-                .write_file(
-                    &format!("{}/README.md", WORKSPACE_ROOT),
-                    readme.as_bytes(),
-                )
-                .await;
-            log::info!("Workspace initialised at {}", WORKSPACE_ROOT);
-        });
     }
 
     /// Fetch CJK font from server and install into egui
@@ -182,6 +194,43 @@ impl AgentApp {
     fn rebuild_llm(&mut self) {
         self.llm = Rc::new(OpenAiCompatProvider::new(self.config.llm.clone()));
     }
+
+    /// Save config to the current storage backend (async, with UI feedback)
+    fn save_config_async(&self) {
+        let storage = self.storage.borrow().clone();
+        let feedback = self.save_feedback.clone();
+        if let Ok(json) = serde_json::to_vec(&self.config) {
+            wasm_bindgen_futures::spawn_local(async move {
+                match storage.set(CONFIG_STORAGE_KEY, &json).await {
+                    Ok(()) => {
+                        let backend = storage.backend_name().to_string();
+                        log::info!("Config saved to {}", backend);
+                        *feedback.borrow_mut() = Some(settings::SaveFeedback {
+                            message: format!("Saved to {}", backend),
+                            success: true,
+                        });
+                    }
+                    Err(e) => {
+                        log::error!("Config save failed: {}", e);
+                        *feedback.borrow_mut() = Some(settings::SaveFeedback {
+                            message: format!("Save failed: {}", e),
+                            success: false,
+                        });
+                    }
+                }
+            });
+        }
+    }
+
+    /// Check if async config restore has completed, and apply it
+    fn poll_pending_config(&mut self) {
+        let restored = self.pending_config.borrow_mut().take();
+        if let Some(config) = restored {
+            log::info!("Applying restored config to UI");
+            self.config = config;
+            self.rebuild_llm();
+        }
+    }
 }
 
 impl eframe::App for AgentApp {
@@ -191,6 +240,9 @@ impl eframe::App for AgentApp {
             Self::load_cjk_font(ctx.clone(), self.font_loaded.clone());
             self.first_frame = false;
         }
+
+        // Poll for async config restoration
+        self.poll_pending_config();
 
         // Drain events from the agent runtime
         let events = self.event_bus.drain();
@@ -222,6 +274,23 @@ impl eframe::App for AgentApp {
                     .color(theme::TEXT_SECONDARY)
                     .small(),
                 );
+
+                // Storage backend indicator
+                {
+                    let backend = self.storage.borrow().backend_name().to_string();
+                    let ready = *self.storage_ready.borrow();
+                    let label = if ready {
+                        format!("[{}]", backend)
+                    } else {
+                        "[storage...]".to_string()
+                    };
+                    ui.label(
+                        RichText::new(label)
+                            .color(theme::TEXT_SECONDARY)
+                            .small(),
+                    );
+                }
+
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
                         .selectable_label(self.ui_state.show_settings, "Settings")
@@ -239,9 +308,18 @@ impl eframe::App for AgentApp {
                 .min_width(280.0)
                 .max_width(350.0)
                 .show(ctx, |ui| {
-                    if settings::settings_panel(ui, &mut self.config) {
-                        self.rebuild_llm();
-                        Self::save_config(self.storage.clone(), &self.config);
+                    let feedback = self.save_feedback.borrow().clone();
+                    let action = settings::settings_panel(ui, &mut self.config, feedback.as_ref());
+                    match action {
+                        settings::SettingsAction::None => {}
+                        settings::SettingsAction::Changed => {
+                            self.rebuild_llm();
+                            self.save_config_async();
+                        }
+                        settings::SettingsAction::SaveClicked => {
+                            self.rebuild_llm();
+                            self.save_config_async();
+                        }
                     }
                 });
         }

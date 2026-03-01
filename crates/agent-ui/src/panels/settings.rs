@@ -1,12 +1,35 @@
 //! Settings panel — LLM provider config, storage mode, API key input.
+//! Now includes explicit Save button with visual feedback.
 
-use egui::{self, RichText};
+use egui::{self, RichText, Vec2};
 use agent_types::config::{AgentConfig, LlmProvider, StorageBackendType};
 use crate::theme::*;
 
-/// Render the settings panel. Returns true if settings were modified.
-pub fn settings_panel(ui: &mut egui::Ui, config: &mut AgentConfig) -> bool {
+/// What the caller should do after rendering the settings panel
+pub enum SettingsAction {
+    /// Nothing changed
+    None,
+    /// A field was changed (auto-save)
+    Changed,
+    /// The user clicked the explicit Save button
+    SaveClicked,
+}
+
+/// Save feedback passed in from the app layer
+#[derive(Clone)]
+pub struct SaveFeedback {
+    pub message: String,
+    pub success: bool,
+}
+
+/// Render the settings panel. Returns an action for the caller to handle.
+pub fn settings_panel(
+    ui: &mut egui::Ui,
+    config: &mut AgentConfig,
+    save_feedback: Option<&SaveFeedback>,
+) -> SettingsAction {
     let mut changed = false;
+    let mut save_clicked = false;
 
     egui::Frame::default()
         .fill(BG_SECONDARY)
@@ -126,9 +149,46 @@ pub fn settings_panel(ui: &mut egui::Ui, config: &mut AgentConfig) -> bool {
                     .small()
                     .italics(),
             );
+
+            // ── Save Button ──────────────────────────────────
+            ui.add_space(16.0);
+            ui.separator();
+            ui.add_space(8.0);
+
+            ui.horizontal(|ui| {
+                let btn = ui.add(
+                    egui::Button::new(
+                        RichText::new("Save Settings")
+                            .color(TEXT_PRIMARY)
+                            .strong(),
+                    )
+                    .fill(ACCENT)
+                    .corner_radius(PANEL_ROUNDING)
+                    .min_size(Vec2::new(120.0, 28.0)),
+                );
+                if btn.clicked() {
+                    save_clicked = true;
+                }
+
+                // Show save feedback
+                if let Some(fb) = save_feedback {
+                    let color = if fb.success { SUCCESS } else { ERROR };
+                    ui.label(
+                        RichText::new(&fb.message)
+                            .color(color)
+                            .small(),
+                    );
+                }
+            });
         });
 
-    changed
+    if save_clicked {
+        SettingsAction::SaveClicked
+    } else if changed {
+        SettingsAction::Changed
+    } else {
+        SettingsAction::None
+    }
 }
 
 fn storage_label(backend: &StorageBackendType) -> &'static str {

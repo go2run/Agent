@@ -1,9 +1,10 @@
 //! Shell adapter — bridges to @wasmer/sdk running in a Web Worker.
 //!
 //! Architecture:
-//! - Main thread (egui) ←→ Web Worker (@wasmer/sdk + WASIX bash)
+//! - Main thread (egui) <-> Web Worker (@wasmer/sdk + WASIX packages)
 //! - Communication via postMessage with JSON-serialized WorkerCommand/WorkerEvent
-//! - The Worker loads @wasmer/sdk and spawns WASIX bash processes
+//! - The Worker loads @wasmer/sdk and can dynamically install WASIX packages
+//!   from the Wasmer registry on demand.
 //!
 //! The worker is created as a module worker (`type: "module"`) so it can
 //! use ES module `import` to load @wasmer/sdk.
@@ -74,11 +75,9 @@ impl WasmerShellAdapter {
                             log::info!("Wasmer-JS worker ready (@wasmer/sdk)");
                         }
                         WorkerEvent::Stdout { id, data } => {
-                            // Forward to streaming channel if one exists
                             if let Some(tx) = streaming_clone.borrow().get(&id) {
                                 let _ = tx.unbounded_send(ShellStreamEvent::Stdout(data.clone()));
                             }
-                            // Also accumulate for non-streaming callers
                             if let Some(exec) = pending_clone.borrow_mut().get_mut(&id) {
                                 exec.stdout.push_str(&data);
                             }
@@ -92,11 +91,9 @@ impl WasmerShellAdapter {
                             }
                         }
                         WorkerEvent::ExitCode { id, code } => {
-                            // Close streaming channel
                             if let Some(tx) = streaming_clone.borrow_mut().remove(&id) {
                                 let _ = tx.unbounded_send(ShellStreamEvent::Exit(code));
                             }
-                            // Resolve one-shot
                             if let Some(mut exec) = pending_clone.borrow_mut().remove(&id) {
                                 if let Some(sender) = exec.sender.take() {
                                     let _ = sender.send(ExecResult {
@@ -108,11 +105,9 @@ impl WasmerShellAdapter {
                             }
                         }
                         WorkerEvent::Error { id, message } => {
-                            // Close streaming channel with error
                             if let Some(tx) = streaming_clone.borrow_mut().remove(&id) {
                                 let _ = tx.unbounded_send(ShellStreamEvent::Error(message.clone()));
                             }
-                            // Resolve one-shot with error
                             if let Some(mut exec) = pending_clone.borrow_mut().remove(&id) {
                                 exec.stderr.push_str(&message);
                                 if let Some(sender) = exec.sender.take() {
@@ -120,6 +115,37 @@ impl WasmerShellAdapter {
                                         stdout: exec.stdout,
                                         stderr: exec.stderr,
                                         exit_code: 1,
+                                    });
+                                }
+                            }
+                        }
+                        WorkerEvent::PackageInstalled { id, package, cached } => {
+                            let msg = if cached {
+                                format!("[cached] {}\n", package)
+                            } else {
+                                format!("[installed] {}\n", package)
+                            };
+                            // Resolve the pending exec for InstallPackage
+                            if let Some(mut exec) = pending_clone.borrow_mut().remove(&id) {
+                                exec.stdout.push_str(&msg);
+                                if let Some(sender) = exec.sender.take() {
+                                    let _ = sender.send(ExecResult {
+                                        stdout: exec.stdout,
+                                        stderr: exec.stderr,
+                                        exit_code: 0,
+                                    });
+                                }
+                            }
+                        }
+                        WorkerEvent::PackageList { id, packages } => {
+                            let list = packages.join("\n") + "\n";
+                            if let Some(mut exec) = pending_clone.borrow_mut().remove(&id) {
+                                exec.stdout.push_str(&list);
+                                if let Some(sender) = exec.sender.take() {
+                                    let _ = sender.send(ExecResult {
+                                        stdout: exec.stdout,
+                                        stderr: exec.stderr,
+                                        exit_code: 0,
                                     });
                                 }
                             }
@@ -141,7 +167,7 @@ impl WasmerShellAdapter {
 
         Ok(Self {
             worker,
-            ready: Rc::new(RefCell::new(false)),
+            ready,
             next_id: RefCell::new(1),
             pending,
             streaming,
@@ -200,10 +226,8 @@ impl ShellPort for WasmerShellAdapter {
         let id = self.next_exec_id();
         let (tx, rx) = mpsc::unbounded();
 
-        // Register the streaming channel
         self.streaming.borrow_mut().insert(id, tx);
 
-        // Also register a pending exec (for cleanup)
         self.pending.borrow_mut().insert(
             id,
             PendingExec {
@@ -213,7 +237,6 @@ impl ShellPort for WasmerShellAdapter {
             },
         );
 
-        // Send the exec command
         if let Err(e) = self.send_command(&WorkerCommand::ExecBash {
             id,
             cmd: cmd.to_string(),
